@@ -838,6 +838,15 @@ with tab2:
             # File selection
             st.subheader("Select Transcript Files to Process")
             
+            # Select/Deselect all buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Select All", key="select_all_transcripts_btn"):
+                    selected_files = [str(f) for f in transcript_files]
+            with col2:
+                if st.button("Deselect All", key="deselect_all_transcripts_btn"):
+                    selected_files = []
+            
             # Display file selection checkboxes
             selected_files = []
             for file_path in transcript_files:
