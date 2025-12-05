@@ -357,6 +357,7 @@ def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_pla
             progress_bar.progress(i / len(video_urls))
         
         # Use yt-dlp to download subtitles as SRT first (most reliable format)
+        # Add timeout and retry options for better reliability
         cmd = [
             "yt-dlp",
             "--write-sub",
@@ -368,16 +369,37 @@ def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_pla
             "srt",
             "--output",
             f"{output_dir}/%(title)s.%(ext)s",
+            "--timeout", "300",  # 5 minute timeout
+            "--retries", "3",  # Retry up to 3 times
+            "--fragment-retries", "5",  # Retry fragments
             video_url
         ]
         
         try:
             # Download subtitles as SRT
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            
+            # Check if the command timed out or failed
+            if result.returncode != 0:
+                if status_placeholder:
+                    if result.returncode == 124:  # Timeout
+                        status_placeholder.text(f"Download timeout for video {i}. The video may be too long or unavailable.")
+                    else:
+                        status_placeholder.text(f"Download failed for video {i}: {result.stderr.strip() if result.stderr else 'Unknown error'}")
+                
+                results['error_count'] += 1
+                error_msg = f"Error downloading subtitles for video {i}: {result.stderr.strip() if result.stderr else 'Unknown error'}"
+                results['errors'].append(error_msg)
+            else:
             
             # Find downloaded SRT file and convert it to TXT
-            import glob
-            srt_files = glob.glob(f"{output_dir}/*.en.srt")
+            try:
+                import glob
+                srt_files = glob.glob(f"{output_dir}/*.en.srt")
+            except Exception as e:
+                if status_placeholder:
+                    status_placeholder.text(f"Error finding SRT files: {str(e)}")
+                srt_files = []
             
             for srt_file in srt_files:
                 # Create corresponding TXT filename
