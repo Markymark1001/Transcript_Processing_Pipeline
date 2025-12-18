@@ -10,6 +10,47 @@ import threading
 import streamlit.components.v1 as components
 import json
 from pathlib import Path
+import base64
+import random
+import time
+
+# Time formatting helper functions
+def format_elapsed_time(seconds):
+    """
+    Convert elapsed seconds to HH:MM:SS format
+    
+    Args:
+        seconds (float): Elapsed time in seconds
+        
+    Returns:
+        str: Formatted time string in HH:MM:SS format
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+def calculate_eta(start_time, current_item, total_items):
+    """
+    Calculate estimated time remaining
+    
+    Args:
+        start_time (float): Process start time in seconds
+        current_item (int): Current item number (1-based)
+        total_items (int): Total number of items
+        
+    Returns:
+        str: Formatted ETA string in HH:MM:SS format, or empty if not enough data
+    """
+    if current_item <= 1 or total_items <= 1:
+        return ""
+    
+    elapsed = time.time() - start_time
+    avg_time_per_item = elapsed / current_item
+    remaining_items = total_items - current_item
+    eta_seconds = avg_time_per_item * remaining_items
+    
+    return format_elapsed_time(eta_seconds)
 
 # Import transcript processing modules
 import sys
@@ -18,6 +59,13 @@ from text_processor import TextProcessor
 from transcript_processor import TranscriptProcessor
 from embedding_generator import EmbeddingGenerator
 import config
+
+# Import prescriptive insights modules
+from prescriptive_insights import (
+    ChunkBuilder, TopicRegistry, TOPICS, RetrievalEngine,
+    LLMClient, InsightsRequest, InsightsOrchestrator,
+    build_persona_prompt, create_insights_orchestrator
+)
 
 # Set page configuration to wide layout
 st.set_page_config(layout="wide", page_title="YouTube ID & Transcript Processor")
@@ -89,7 +137,7 @@ def get_video_list_flat(url, status_placeholder, start_time=None):
     # Update status with elapsed time if start_time is provided
     if start_time:
         elapsed = time.time() - start_time
-        status_placeholder.text(f"Getting video list... (Elapsed: {elapsed:.1f}s)")
+        status_placeholder.text(f"Getting video list... (Elapsed: {format_elapsed_time(elapsed)})")
     else:
         status_placeholder.text("Getting video list...")
     
@@ -209,10 +257,12 @@ def get_video_metadata_batch(video_urls, status_placeholder, batch_size=3, delay
         start_video = i + 1
         end_video = min(i + batch_size, total_videos)
         
-        # Include elapsed time if start_time is provided
+        # Include elapsed time and ETA if start_time is provided
         if start_time:
             elapsed = time.time() - start_time
-            status_placeholder.text(f"Getting upload dates: videos {start_video}-{end_video} of {total_videos} (batch {batch_num}/{total_batches})... (Elapsed: {elapsed:.1f}s)")
+            eta = calculate_eta(start_time, start_video, total_videos)
+            eta_text = f" | ETA: {eta}" if eta else ""
+            status_placeholder.text(f"Getting upload dates: videos {start_video}-{end_video} of {total_videos} (batch {batch_num}/{total_batches})... (Elapsed: {format_elapsed_time(elapsed)}){eta_text}")
         else:
             status_placeholder.text(f"Getting upload dates: videos {start_video}-{end_video} of {total_videos} (batch {batch_num}/{total_batches})...")
         
@@ -261,7 +311,7 @@ def fetch_metadata(url):
         
         # Include elapsed time in final message
         elapsed = time.time() - start_time
-        status_placeholder.text(f"Finalizing results... (Total elapsed: {elapsed:.1f}s)")
+        status_placeholder.text(f"Finalizing results... (Total elapsed: {format_elapsed_time(elapsed)})")
         
         # Create DataFrame and sort by upload_date (newest first)
         df = pd.DataFrame(videos)
@@ -271,7 +321,7 @@ def fetch_metadata(url):
         df['upload_date'] = pd.to_datetime(df['upload_date'], errors='coerce').dt.date
         
         # Sort by upload_date in descending order (newest first)
-        # Put videos with no upload_date at the end
+        # Put videos with no upload_date at end
         df = df.sort_values(by='upload_date', ascending=False, na_position='last')
         
         # Clear status placeholder
@@ -324,7 +374,7 @@ def convert_srt_to_txt(srt_file_path, txt_file_path):
         print(f"Error converting SRT to TXT: {str(e)}")
         return False
 
-def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_placeholder=None, progress_bar=None):
+def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_placeholder=None, progress_bar=None, min_delay=0.0, max_delay=0.0):
     """
     Download subtitles for a list of YouTube videos in TXT format
     
@@ -333,24 +383,60 @@ def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_pla
         output_dir (str): Directory to save subtitles
         status_placeholder: Streamlit placeholder for status updates
         progress_bar: Streamlit progress bar for visual progress tracking
+        min_delay (float): Minimum delay between video downloads in seconds
+        max_delay (float): Maximum delay between video downloads in seconds
         
     Returns:
-        dict: Results with success count, error count, and error details
+        dict: Results with success count, error count, and detailed error entries
     """
+    import glob
+    
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     
+    # Check for existing downloads to resume
+    existing_files = set()
+    if os.path.exists(output_dir):
+        existing_files = set(Path(f).stem for f in os.listdir(output_dir) if f.endswith('.txt'))
+    
     results = {
         'success_count': 0,
         'error_count': 0,
-        'errors': []
+        'errors': [],  # Now contains structured error entries
+        'skipped_count': 0
     }
+    
+    # Track start time for ETA calculations
+    download_start_time = time.time()
     
     # Download subtitles for each video
     for i, video_url in enumerate(video_urls, 1):
+        # Extract video ID/title to check if already downloaded
+        video_id = video_url.split('v=')[-1].split('&')[0] if 'v=' in video_url else video_url.split('/')[-1]
+        
+        # Check if this video's subtitles already exist
+        if video_id in existing_files:
+            # Calculate ETA for skip messages
+            eta = calculate_eta(download_start_time, i, len(video_urls))
+            eta_text = f" | ETA: {eta}" if eta else ""
+            
+            if status_placeholder:
+                status_placeholder.text(f"Skipping video {i}/{len(video_urls)}: {video_url} (already downloaded){eta_text}")
+            
+            results['skipped_count'] += 1
+            
+            # Update progress bar if provided
+            if progress_bar:
+                progress_bar.progress(i / len(video_urls))
+            continue
+        
+        # Calculate ETA for processing messages
+        eta = calculate_eta(download_start_time, i, len(video_urls))
+        eta_text = f" | ETA: {eta}" if eta else ""
+        
         if status_placeholder:
-            status_placeholder.text(f"Processing video {i}/{len(video_urls)}: {video_url}")
+            status_placeholder.text(f"Processing video {i}/{len(video_urls)}: {video_url}{eta_text}")
         
         # Update progress bar if provided
         if progress_bar:
@@ -366,68 +452,196 @@ def download_subtitles_for_videos(video_urls, output_dir="subtitles", status_pla
             "en",
             "--skip-download",
             "--sub-format",
-            "srt",
+            "srt/vtt/best",
+            "--no-check-certificate",
             "--output",
-            f"{output_dir}/%(title)s.%(ext)s",
-            "--timeout", "300",  # 5 minute timeout
+            f"{output_dir}/%(id)s.%(ext)s",
+            "--socket-timeout", "300",  # 5 minute timeout
             "--retries", "3",  # Retry up to 3 times
             "--fragment-retries", "5",  # Retry fragments
             video_url
         ]
         
         try:
-            # Download subtitles as SRT
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=300)
+            # Download subtitles with full output capture (similar to batch_download.py)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             
-            # Check if the command timed out or failed
+            # Check if the command failed
             if result.returncode != 0:
+                # Create structured error entry
+                stderr_output = result.stderr.strip() if result.stderr else "No stderr output"
+                stdout_output = result.stdout.strip() if result.stdout else "No stdout output"
+                
+                # Trim output to reasonable length (max 500 chars each)
+                if len(stderr_output) > 500:
+                    stderr_output = stderr_output[:500] + "... (truncated)"
+                if len(stdout_output) > 500:
+                    stdout_output = stdout_output[:500] + "... (truncated)"
+                
+                error_entry = {
+                    'url': video_url,
+                    'exit_code': result.returncode,
+                    'stdout': stdout_output,
+                    'stderr': stderr_output,
+                    'command': ' '.join(cmd)
+                }
+                results['errors'].append(error_entry)
+                results['error_count'] += 1
+                
+                # Calculate ETA for error messages
+                eta = calculate_eta(download_start_time, i, len(video_urls))
+                eta_text = f" | ETA: {eta}" if eta else ""
+                
                 if status_placeholder:
                     if result.returncode == 124:  # Timeout
-                        status_placeholder.text(f"Download timeout for video {i}. The video may be too long or unavailable.")
+                        status_placeholder.text(f"Download timeout for video {i}. The video may be too long or unavailable.{eta_text}")
                     else:
-                        status_placeholder.text(f"Download failed for video {i}: {result.stderr.strip() if result.stderr else 'Unknown error'}")
-                
-                results['error_count'] += 1
-                error_msg = f"Error downloading subtitles for video {i}: {result.stderr.strip() if result.stderr else 'Unknown error'}"
-                results['errors'].append(error_msg)
+                        status_placeholder.text(f"Download failed for video {i}: {stderr_output[:100]}...{eta_text}")
             else:
-            
-            # Find downloaded SRT file and convert it to TXT
-            try:
-                import glob
-                srt_files = glob.glob(f"{output_dir}/*.en.srt")
-            except Exception as e:
-                if status_placeholder:
-                    status_placeholder.text(f"Error finding SRT files: {str(e)}")
-                srt_files = []
-            
-            for srt_file in srt_files:
-                # Create corresponding TXT filename
-                txt_file = srt_file.replace('.srt', '.txt')
+                # Find downloaded subtitle files and convert them to TXT
+                srt_files = glob.glob(f"{output_dir}/*.en.srt") + glob.glob(f"{output_dir}/*.srt")
+                vtt_files = glob.glob(f"{output_dir}/*.en.vtt") + glob.glob(f"{output_dir}/*.vtt")
                 
-                # Convert SRT to TXT
-                if convert_srt_to_txt(srt_file, txt_file):
+                # Filter to only recently modified files (within last 60 seconds)
+                current_time = time.time()
+                recent_srt = [f for f in srt_files if current_time - os.path.getmtime(f) < 60]
+                recent_vtt = [f for f in vtt_files if current_time - os.path.getmtime(f) < 60]
+                
+                if not recent_srt and not recent_vtt:
+                    # No subtitles found - create structured error entry
+                    error_entry = {
+                        'url': video_url,
+                        'exit_code': 0,
+                        'stdout': result.stdout.strip() if result.stdout else "No stdout output",
+                        'stderr': 'No subtitle file found after download',
+                        'command': ' '.join(cmd)
+                    }
+                    results['errors'].append(error_entry)
+                    results['error_count'] += 1
+                    
+                    # Calculate ETA for no subtitles message
+                    eta = calculate_eta(download_start_time, i, len(video_urls))
+                    eta_text = f" | ETA: {eta}" if eta else ""
+                    
                     if status_placeholder:
-                        status_placeholder.text(f"Successfully downloaded and converted subtitles for video {i} to TXT format")
+                        status_placeholder.text(f"No subtitles found for video {i}{eta_text}")
                 else:
-                    # If conversion fails, keep the SRT file
-                    if status_placeholder:
-                        status_placeholder.text(f"Downloaded subtitles for video {i} in SRT format (conversion to TXT failed)")
+                    converted = False
+                    
+                    # Prefer SRT files, fallback to VTT
+                    for srt_file in recent_srt:
+                        # Create corresponding TXT filename
+                        txt_file = srt_file.replace('.srt', '.txt')
+                        
+                        # Convert SRT to TXT
+                        if convert_srt_to_txt(srt_file, txt_file):
+                            # Calculate ETA for success message
+                            eta = calculate_eta(download_start_time, i, len(video_urls))
+                            eta_text = f" | ETA: {eta}" if eta else ""
+                            
+                            if status_placeholder:
+                                status_placeholder.text(f"Successfully downloaded and converted subtitles for video {i} to TXT format{eta_text}")
+                            converted = True
+                            existing_files.add(video_id)
+                        else:
+                            # If conversion fails, keep the SRT file
+                            # Calculate ETA for conversion failed message
+                            eta = calculate_eta(download_start_time, i, len(video_urls))
+                            eta_text = f" | ETA: {eta}" if eta else ""
+                            
+                            if status_placeholder:
+                                status_placeholder.text(f"Downloaded subtitles for video {i} in SRT format (conversion to TXT failed){eta_text}")
+                    
+                    # If no SRT converted, try VTT
+                    if not converted:
+                        for vtt_file in recent_vtt:
+                            # Create corresponding TXT filename
+                            txt_file = vtt_file.replace('.vtt', '.txt')
+                            
+                            # Convert VTT to TXT (reuse SRT conversion as format is similar)
+                            if convert_srt_to_txt(vtt_file, txt_file):
+                                # Calculate ETA for VTT success message
+                                eta = calculate_eta(download_start_time, i, len(video_urls))
+                                eta_text = f" | ETA: {eta}" if eta else ""
+                                
+                                if status_placeholder:
+                                    status_placeholder.text(f"Successfully converted VTT subtitles for video {i} to TXT format{eta_text}")
+                                converted = True
+                                existing_files.add(video_id)
+                    
+                    if converted:
+                        results['success_count'] += 1
+                    else:
+                        results['error_count'] += 1
             
-            results['success_count'] += 1
+        except subprocess.TimeoutExpired:
+            # Calculate ETA for timeout error
+            eta = calculate_eta(download_start_time, i, len(video_urls))
+            eta_text = f" | ETA: {eta}" if eta else ""
             
-        except subprocess.CalledProcessError as e:
+            error_entry = {
+                'url': video_url,
+                'exit_code': None,
+                'stdout': None,
+                'stderr': f"Process timed out after 300 seconds",
+                'command': ' '.join(cmd)
+            }
+            results['errors'].append(error_entry)
             results['error_count'] += 1
-            error_msg = f"Error downloading subtitles for video {i}: {e}"
-            results['errors'].append(error_msg)
             if status_placeholder:
-                status_placeholder.text(error_msg)
+                status_placeholder.text(f"Timeout downloading subtitles for video {i}{eta_text}")
+                
+        except subprocess.CalledProcessError as e:
+            # Calculate ETA for called process error
+            eta = calculate_eta(download_start_time, i, len(video_urls))
+            eta_text = f" | ETA: {eta}" if eta else ""
+            
+            error_entry = {
+                'url': video_url,
+                'exit_code': e.returncode,
+                'stdout': e.stdout if hasattr(e, 'stdout') else None,
+                'stderr': e.stderr if hasattr(e, 'stderr') else str(e),
+                'command': ' '.join(cmd)
+            }
+            results['errors'].append(error_entry)
+            results['error_count'] += 1
+            if status_placeholder:
+                status_placeholder.text(f"Error downloading subtitles for video {i}: {e}{eta_text}")
+        
+        except Exception as e:
+            # Calculate ETA for general exception
+            eta = calculate_eta(download_start_time, i, len(video_urls))
+            eta_text = f" | ETA: {eta}" if eta else ""
+            
+            error_entry = {
+                'url': video_url,
+                'exit_code': None,
+                'stdout': None,
+                'stderr': str(e),
+                'command': ' '.join(cmd)
+            }
+            results['errors'].append(error_entry)
+            results['error_count'] += 1
+            if status_placeholder:
+                status_placeholder.text(f"Unexpected error for video {i}: {e}{eta_text}")
+        
+        # Add random delay between videos if min_delay or max_delay is greater than 0
+        if min_delay > 0 or max_delay > 0:
+            delay_time = random.uniform(min_delay, max_delay)
+            if delay_time > 0 and i < len(video_urls):  # Don't delay after last video
+                # Calculate ETA for delay message
+                eta = calculate_eta(download_start_time, i, len(video_urls))
+                eta_text = f" | ETA: {eta}" if eta else ""
+                
+                if status_placeholder:
+                    status_placeholder.text(f"Waiting {delay_time:.1f}s before next download (rate limiting)...{eta_text}")
+                time.sleep(delay_time)
     
     return results
 
 def process_transcripts_with_pipeline(transcript_files, status_placeholder=None, progress_bar=None):
     """
-    Process transcript files using the spaCy pipeline
+    Process transcript files using spaCy pipeline
     
     Args:
         transcript_files (list): List of transcript file paths
@@ -529,7 +743,7 @@ def process_transcripts_with_pipeline(transcript_files, status_placeholder=None,
 st.title("YouTube ID & Transcript Processor")
 
 # Create tabs for different functionalities
-tab1, tab2, tab3 = st.tabs(["📺 YouTube Extractor", "📝 Transcript Processor", "📊 Analysis Results"])
+tab1, tab2, tab3, tab4 = st.tabs(["📺 YouTube Extractor", "📝 Transcript Processor", "📊 Analysis Results", "💊 Prescriptive Insights"])
 
 # Tab 1: YouTube ID Extractor (based on original app)
 with tab1:
@@ -792,6 +1006,41 @@ with tab1:
             video_urls = "\n".join(filtered_df['full_url'].tolist())
             st.text_area("YouTube URLs (copy this)", value=video_urls, height=200)
             
+            # Add download subtitles section with delay controls
+            st.subheader("Download Controls")
+            
+            # Delay controls in columns
+            delay_col1, delay_col2 = st.columns(2)
+            with delay_col1:
+                min_delay = st.number_input(
+                    "Min Delay (seconds)",
+                    min_value=0.0,
+                    max_value=60.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Minimum delay between video downloads to respect rate limits",
+                    key="min_delay_input"
+                )
+            with delay_col2:
+                max_delay = st.number_input(
+                    "Max Delay (seconds)",
+                    min_value=0.0,
+                    max_value=60.0,
+                    value=0.0,
+                    step=0.5,
+                    help="Maximum delay between video downloads (random delay between min and max)",
+                    key="max_delay_input"
+                )
+            
+            # Validate delay values
+            if max_delay < min_delay:
+                st.warning("Max delay should be >= min delay. Using min delay for both.")
+                max_delay = min_delay
+            
+            # Show delay info if enabled
+            if min_delay > 0 or max_delay > 0:
+                st.info(f"⏱️ Rate limiting enabled: Random delay of {min_delay:.1f}s - {max_delay:.1f}s between downloads")
+            
             # Add download subtitles button
             col1, col2 = st.columns(2)
             with col1:
@@ -807,30 +1056,88 @@ with tab1:
                 # Get the list of selected video URLs
                 selected_video_urls = filtered_df['full_url'].tolist()
                 
-                # Download subtitles with progress bar
+                # Download subtitles with progress bar and delay settings
                 results = download_subtitles_for_videos(
                     selected_video_urls,
                     output_dir="subtitles",
                     status_placeholder=status_placeholder,
-                    progress_bar=progress_bar
+                    progress_bar=progress_bar,
+                    min_delay=min_delay,
+                    max_delay=max_delay
                 )
                 
                 # Display results
                 status_placeholder.empty()
                 progress_bar.empty()
                 
-                if results['success_count'] > 0:
-                    st.success(f"Successfully downloaded subtitles for {results['success_count']} videos as TXT files")
+                # Summary section
+                st.subheader("Download Summary")
                 
+                summary_col1, summary_col2, summary_col3 = st.columns(3)
+                with summary_col1:
+                    if results['success_count'] > 0:
+                        st.success(f"✅ Success: {results['success_count']}")
+                    else:
+                        st.metric("Success", results['success_count'])
+                with summary_col2:
+                    if results.get('skipped_count', 0) > 0:
+                        st.info(f"⏭️ Skipped: {results['skipped_count']}")
+                    else:
+                        st.metric("Skipped", results.get('skipped_count', 0))
+                with summary_col3:
+                    if results['error_count'] > 0:
+                        st.error(f"❌ Failed: {results['error_count']}")
+                    else:
+                        st.metric("Failed", results['error_count'])
+                
+                # Detailed download log expander for errors
                 if results['error_count'] > 0:
-                    st.error(f"Failed to download subtitles for {results['error_count']} videos")
-                    with st.expander("Error Details"):
-                        for error in results['errors']:
-                            st.error(error)
+                    st.warning(f"⚠️ {results['error_count']} video(s) failed. See 'Detailed download log' below for diagnostics.")
+                    
+                    with st.expander("📋 Detailed download log", expanded=False):
+                        st.markdown("### Failed Downloads Diagnostics")
+                        st.markdown("---")
+                        
+                        for idx, error in enumerate(results['errors'], 1):
+                            if isinstance(error, dict):
+                                # Structured error entry
+                                st.markdown(f"**Video {idx}:** `{error.get('url', 'Unknown URL')}`")
+                                
+                                # Create diagnostics table
+                                diag_data = {
+                                    "Field": ["Exit Code", "STDOUT (trimmed)", "STDERR (trimmed)"],
+                                    "Value": [
+                                        str(error.get('exit_code', 'N/A')),
+                                        (error.get('stdout', 'N/A') or 'N/A')[:200] + ('...' if error.get('stdout') and len(error.get('stdout', '')) > 200 else ''),
+                                        (error.get('stderr', 'N/A') or 'N/A')[:200] + ('...' if error.get('stderr') and len(error.get('stderr', '')) > 200 else '')
+                                    ]
+                                }
+                                st.table(diag_data)
+                                
+                                # Show full command in a code block
+                                with st.expander(f"Full command for video {idx}"):
+                                    st.code(error.get('command', 'N/A'), language="bash")
+                                
+                                # Full output text areas
+                                if error.get('stdout'):
+                                    st.text_area(f"Full STDOUT (Video {idx})", value=error['stdout'], height=100, key=f"stdout_{idx}")
+                                if error.get('stderr'):
+                                    st.text_area(f"Full STDERR (Video {idx})", value=error['stderr'], height=100, key=f"stderr_{idx}")
+                                
+                                st.markdown("---")
+                            else:
+                                # Legacy string error format
+                                st.error(f"**Video {idx}:** {error}")
+                                st.markdown("---")
                 
                 # Show download link for subtitles directory
                 if os.path.exists("subtitles") and os.listdir("subtitles"):
-                    st.info("Subtitle files have been saved to the 'subtitles' directory as TXT files")
+                    total_files = len([f for f in os.listdir("subtitles") if f.endswith('.txt')])
+                    st.info(f"📁 Subtitle files saved to 'subtitles' directory ({total_files} total TXT files)")
+                    
+                    # Add resume info
+                    if results.get('skipped_count', 0) > 0:
+                        st.info("💡 **Resume Feature**: Already downloaded files were automatically skipped. You can safely restart the download process if it gets interrupted.")
         else:
             st.info("No videos selected matching the criteria")
 
@@ -855,81 +1162,68 @@ with tab2:
         transcript_files = list(subtitles_dir.glob("*.txt"))
         
         if transcript_files:
-            st.success(f"Found {len(transcript_files)} transcript files in the 'subtitles' directory")
+            # Display info panel summarizing discovered transcripts
+            st.subheader("Transcript Processing Summary")
             
-            # File selection
-            st.subheader("Select Transcript Files to Process")
-            
-            # Select/Deselect all buttons
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("Select All", key="select_all_transcripts_btn"):
-                    selected_files = [str(f) for f in transcript_files]
+                st.metric("Total Transcripts Found", len(transcript_files))
             with col2:
-                if st.button("Deselect All", key="deselect_all_transcripts_btn"):
-                    selected_files = []
+                st.metric("Output Directory", "processed_transcripts/")
             
-            # Display file selection checkboxes
-            selected_files = []
-            for file_path in transcript_files:
-                if st.checkbox(file_path.name, key=f"file_{file_path.stem}"):
-                    selected_files.append(str(file_path))
+            st.info(f"All {len(transcript_files)} discovered transcripts in 'subtitles/' will be processed in one go.")
             
-            if selected_files:
-                st.write(f"Selected {len(selected_files)} files for processing")
+            # Process all transcripts button
+            if st.button("Run Transcript Pipeline", key="run_pipeline_btn"):
+                # Create placeholders for status and progress
+                status_placeholder = st.empty()
+                progress_bar = st.progress(0)
                 
-                # Process button
-                if st.button("Process Selected Transcripts", key="process_transcripts_btn"):
-                    # Create placeholders for status and progress
-                    status_placeholder = st.empty()
-                    progress_bar = st.progress(0)
+                # Process all transcripts
+                transcript_file_paths = [str(f) for f in transcript_files]
+                results = process_transcripts_with_pipeline(
+                    transcript_file_paths,
+                    status_placeholder=status_placeholder,
+                    progress_bar=progress_bar
+                )
+                
+                # Clear placeholders
+                status_placeholder.empty()
+                progress_bar.empty()
+                
+                # Display results
+                if results['processed_count'] > 0:
+                    st.success(f"Successfully processed {results['processed_count']} transcripts")
                     
-                    # Process transcripts
-                    results = process_transcripts_with_pipeline(
-                        selected_files,
-                        status_placeholder=status_placeholder,
-                        progress_bar=progress_bar
-                    )
-                    
-                    # Clear placeholders
-                    status_placeholder.empty()
-                    progress_bar.empty()
-                    
-                    # Display results
-                    if results['processed_count'] > 0:
-                        st.success(f"Successfully processed {results['processed_count']} transcripts")
+                    # Display summary statistics
+                    if 'summary' in results:
+                        summary = results['summary']
+                        st.subheader("Processing Summary")
                         
-                        # Display summary statistics
-                        if 'summary' in results:
-                            summary = results['summary']
-                            st.subheader("Processing Summary")
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Total Transcripts", summary['total_transcripts'])
-                                st.metric("Successful", summary['successful_transcripts'])
-                                st.metric("Failed", summary['failed_transcripts'])
-                            
-                            with col2:
-                                st.metric("Total Statements", summary['total_statements'])
-                                st.metric("Total Entities", summary['total_entities'])
-                            
-                            with col3:
-                                st.metric("Original Characters", summary['total_original_characters'])
-                                st.metric("Cleaned Characters", summary['total_cleaned_characters'])
-                                st.metric("Compression Ratio", f"{summary['compression_ratio']:.2%}")
-                    
-                    if results['error_count'] > 0:
-                        st.error(f"Failed to process {results['error_count']} transcripts")
-                        with st.expander("Error Details"):
-                            for error in results['errors']:
-                                st.error(error)
-                    
-                    # Show download link for processed transcripts
-                    if os.path.exists("processed_transcripts") and os.listdir("processed_transcripts"):
-                        st.info("Processed transcripts have been saved to the 'processed_transcripts' directory")
-            else:
-                st.warning("Please select at least one transcript file to process")
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Total Transcripts", summary['total_transcripts'])
+                            st.metric("Successful", summary['successful_transcripts'])
+                            st.metric("Failed", summary['failed_transcripts'])
+                        
+                        with col2:
+                            st.metric("Total Statements", summary['total_statements'])
+                            st.metric("Total Entities", summary['total_entities'])
+                        
+                        with col3:
+                            st.metric("Original Characters", summary['total_original_characters'])
+                            st.metric("Cleaned Characters", summary['total_cleaned_characters'])
+                            st.metric("Compression Ratio", f"{summary['compression_ratio']:.2%}")
+                
+                if results['error_count'] > 0:
+                    st.error(f"Failed to process {results['error_count']} transcripts")
+                    with st.expander("Error Details"):
+                        for error in results['errors']:
+                            st.error(error)
+                
+                # Show download link for processed transcripts
+                if os.path.exists("processed_transcripts") and os.listdir("processed_transcripts"):
+                    st.info("Processed transcripts have been saved to the 'processed_transcripts' directory")
         else:
             st.warning("No transcript files found in the 'subtitles' directory. Please download subtitles first using the YouTube Extractor tab.")
     else:
@@ -1024,3 +1318,309 @@ with tab3:
             st.warning("No processed transcript files found. Please process transcripts first using the Transcript Processor tab.")
     else:
         st.warning("No 'processed_transcripts' directory found. Please process transcripts first using the Transcript Processor tab.")
+
+# Tab 4: Prescriptive Insights
+with tab4:
+    st.header("Prescriptive Insights Generator")
+    
+    st.info("""
+    **💊 Prescriptive Insights with AI**
+    
+    This tab generates personalized health plans by analyzing processed transcripts:
+    - Select topics of interest from available categories
+    - Customize persona tone and keywords
+    - Generate evidence-based prescriptive plans with citations
+    - Download results as Markdown or view evidence chunks
+    """)
+    
+    # Initialize session state for prescriptive insights
+    if 'insights_generated' not in st.session_state:
+        st.session_state.insights_generated = False
+    if 'current_insights' not in st.session_state:
+        st.session_state.current_insights = None
+    if 'retrieved_chunks' not in st.session_state:
+        st.session_state.retrieved_chunks = []
+    
+    # Check if processed transcripts exist
+    processed_dir = Path("processed_transcripts")
+    if not processed_dir.exists() or not list(processed_dir.glob("*_processed.json")):
+        st.warning("No processed transcripts found. Please process transcripts first using the Transcript Processor tab.")
+        st.stop()
+    
+    # Check if chunk index exists
+    chunk_index_path = config.INSIGHTS_CHUNK_DIR / "master_chunks.parquet"
+    if not chunk_index_path.exists():
+        st.warning("No chunk index found. Please build chunk index first.")
+        if st.button("Build Chunk Index", key="build_chunk_index_btn"):
+            with st.spinner("Building chunk index from processed transcripts..."):
+                try:
+                    chunk_builder = ChunkBuilder()
+                    stats = chunk_builder.build_chunks()
+                    st.success(f"Successfully built chunk index with {stats['total_chunks']} chunks from {stats['processed_transcripts']} transcripts.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error building chunk index: {str(e)}")
+    else:
+        # Display chunk index statistics
+        try:
+            retrieval_engine = RetrievalEngine()
+            stats = retrieval_engine.get_statistics()
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Chunks", stats['total_chunks'])
+                st.metric("Source Transcripts", stats['total_transcripts'])
+            with col2:
+                st.metric("Avg Chunk Length", f"{stats['avg_chunk_length']:.0f} chars")
+                if 'chunks_with_embeddings' in stats:
+                    st.metric("Chunks with Embeddings", stats['chunks_with_embeddings'])
+            with col3:
+                st.metric("Topics Available", len(stats['topics_available']))
+                if 'embedding_coverage' in stats:
+                    st.metric("Embedding Coverage", f"{stats['embedding_coverage']:.1%}")
+        except Exception as e:
+            st.error(f"Error loading chunk index: {str(e)}")
+            st.info("Please try rebuilding the chunk index.")
+            if st.button("Rebuild Chunk Index", key="rebuild_chunk_index_btn"):
+                with st.spinner("Rebuilding chunk index..."):
+                    try:
+                        chunk_builder = ChunkBuilder()
+                        stats = chunk_builder.build_chunks(force_rebuild=True)
+                        st.success(f"Successfully rebuilt chunk index with {stats['total_chunks']} chunks.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error rebuilding chunk index: {str(e)}")
+    
+    # Check Ollama connection
+    try:
+        llm_client = LLMClient()
+        health = llm_client.health_check()
+        
+        if health["status"] != "healthy":
+            st.error("Ollama server is not running or unhealthy. Please start Ollama and pull a model.")
+            st.info("See [OLLAMA_GUIDE.md](OLLAMA_GUIDE.md) for setup instructions.")
+            st.stop()
+    except Exception as e:
+        st.error(f"Error connecting to Ollama: {str(e)}")
+        st.info("See [OLLAMA_GUIDE.md](OLLAMA_GUIDE.md) for setup instructions.")
+        st.stop()
+    
+    # Prescriptive Insights UI Controls
+    st.subheader("Generate Prescriptive Plan")
+    
+    # Topic selection
+    topic_registry = TopicRegistry()
+    available_topics = topic_registry.get_all_topics()
+    topic_options = {topic_id: topic.name for topic_id, topic in available_topics.items()}
+    
+    selected_topics = st.multiselect(
+        "Select Topics",
+        options=list(topic_options.keys()),
+        format_func=lambda x: topic_options[x],
+        default=["start_plan", "supplements", "holistic_view"],
+        help="Select topics you want to include in the prescriptive plan"
+    )
+    
+    # Persona and customization options
+    col1, col2 = st.columns(2)
+    with col1:
+        persona_toggle = st.toggle(
+            "Medical/Empathetic Persona",
+            value=True,
+            help="Enable medical authority with patient empathy tone"
+        )
+        evidence_preview = st.toggle(
+            "Show Evidence Preview",
+            value=False,
+            help="Show preview of retrieved chunks before generating plan"
+        )
+    
+    with col2:
+        chunk_limit = st.slider(
+            "Chunk Limit per Topic",
+            min_value=5,
+            max_value=50,
+            value=15,
+            step=5,
+            help="Maximum number of chunks to retrieve per topic"
+        )
+        use_semantic_search = st.toggle(
+            "Semantic Search",
+            value=True,
+            help="Use semantic similarity for better chunk ranking"
+        )
+    
+    # Keyword overrides and patient context
+    with st.expander("Advanced Options"):
+        keyword_overrides = {}
+        
+        for topic_id in selected_topics:
+            topic = topic_registry.get_topic(topic_id)
+            default_keywords = ", ".join(topic.keywords[:3])  # Show first 3 keywords as example
+            custom_keywords = st.text_input(
+                f"Keywords for {topic.name}",
+                value="",
+                placeholder=f"Default: {default_keywords}",
+                key=f"keywords_{topic_id}",
+                help=f"Override default keywords for {topic.name}. Leave empty to use defaults."
+            )
+            
+            if custom_keywords.strip():
+                keyword_overrides[topic_id] = [k.strip() for k in custom_keywords.split(",")]
+        
+        patient_context = st.text_area(
+            "Patient Context (Optional)",
+            value="",
+            placeholder="e.g., 45-year-old female with insulin resistance, looking to start keto diet",
+            help="Provide specific patient context for personalized recommendations"
+        )
+        
+        custom_persona_additions = st.text_area(
+            "Custom Persona Additions (Optional)",
+            value="",
+            placeholder="Additional instructions for the AI persona",
+            help="Add custom instructions to the AI persona"
+        )
+    
+    # Generate button
+    generate_button = st.button(
+        "Generate Prescriptive Plan",
+        type="primary",
+        disabled=not selected_topics,
+        help="Generate a prescriptive plan based on selected topics and options"
+    )
+    
+    if generate_button and selected_topics:
+        with st.spinner("Retrieving relevant chunks and generating insights..."):
+            try:
+                # Initialize retrieval engine
+                retrieval_engine = RetrievalEngine()
+                
+                # Retrieve chunks for each selected topic
+                all_chunks = []
+                for topic_id in selected_topics:
+                    keywords = keyword_overrides.get(topic_id)
+                    topic_chunks = retrieval_engine.search_by_topic(
+                        topic_id=topic_id,
+                        keywords=keywords,
+                        top_k=chunk_limit,
+                        use_semantic=use_semantic_search
+                    )
+                    all_chunks.extend(topic_chunks)
+                
+                # Remove duplicates by chunk_id
+                seen_ids = set()
+                unique_chunks = []
+                for chunk in all_chunks:
+                    if chunk["chunk_id"] not in seen_ids:
+                        seen_ids.add(chunk["chunk_id"])
+                        unique_chunks.append(chunk)
+                
+                # Sort by importance and limit total
+                unique_chunks.sort(
+                    key=lambda x: x.get("max_importance_score", 0), 
+                    reverse=True
+                )
+                
+                total_chunks = unique_chunks[:chunk_limit * len(selected_topics)]
+                st.session_state.retrieved_chunks = total_chunks
+                
+                if evidence_preview:
+                    st.subheader("Evidence Preview")
+                    st.info(f"Found {len(total_chunks)} relevant chunks. Showing top 10:")
+                    
+                    for i, chunk in enumerate(total_chunks[:10], 1):
+                        with st.expander(f"Chunk {i}: {chunk['chunk_id']} (Score: {chunk.get('max_importance_score', 0):.3f})"):
+                            st.write(chunk["text"][:500] + "..." if len(chunk["text"]) > 500 else chunk["text"])
+                            st.write(f"**Topics:** {', '.join(chunk.get('matching_topics', []))}")
+                            st.write(f"**Source:** {chunk['transcript_id']}")
+                
+                # Generate insights
+                orchestrator = create_insights_orchestrator(
+                    retrieval_engine=retrieval_engine,
+                    llm_client=llm_client
+                )
+                
+                # Create insights request
+                request = InsightsRequest(
+                    topics=selected_topics,
+                    persona_toggle=persona_toggle,
+                    keyword_overrides=keyword_overrides,
+                    chunk_limit=chunk_limit,
+                    include_supplements="supplements" in selected_topics,
+                    patient_context=patient_context,
+                    custom_persona_additions=custom_persona_additions,
+                    use_semantic_search=use_semantic_search
+                )
+                
+                # Generate insights
+                insights_response = orchestrator.generate_insights(request)
+                st.session_state.current_insights = insights_response
+                st.session_state.insights_generated = True
+                
+                st.success("Prescriptive plan generated successfully!")
+                
+            except Exception as e:
+                st.error(f"Error generating prescriptive plan: {str(e)}")
+                st.info("Please check your Ollama connection and try again.")
+    
+    # Display generated insights
+    if st.session_state.insights_generated and st.session_state.current_insights:
+        insights = st.session_state.current_insights
+        
+        st.subheader("Generated Prescriptive Plan")
+        
+        # Display sections
+        for section in insights.sections:
+            st.markdown(f"### {section.title}")
+            st.write(section.content)
+            
+            # Show citations if available
+            if section.citations:
+                with st.expander(f"Citations for {section.title}"):
+                    for citation in section.citations:
+                        st.code(f"[{citation}]")
+        
+        # Download options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Markdown download
+            markdown_content = f"# Prescriptive Health Plan\n\n"
+            markdown_content += f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            markdown_content += f"**Topics:** {', '.join([topic_registry.get_topic(t).name for t in insights.generation_metadata.get('topics_requested', [])])}\n\n"
+            markdown_content += f"**Chunks Used:** {len(insights.chunks_used)}\n\n"
+            markdown_content += "---\n\n"
+            
+            for section in insights.sections:
+                markdown_content += f"## {section.title}\n\n"
+                markdown_content += f"{section.content}\n\n"
+                if section.citations:
+                    markdown_content += f"**Citations:** {', '.join([f'[{c}]' for c in section.citations])}\n\n"
+            
+            b64 = base64.b64encode(markdown_content.encode()).decode()
+            href = f'<a href="data:file/markdown;base64,{b64}" download="prescriptive_plan.md">Download Prescriptive Plan (Markdown)</a>'
+            st.markdown(href, unsafe_allow_html=True)
+        
+        with col2:
+            # Evidence table
+            if st.button("Show Evidence Table"):
+                st.subheader("Evidence Chunks")
+                
+                evidence_data = []
+                for chunk_id in insights.chunks_used:
+                    chunk = retrieval_engine.get_chunk_by_id(chunk_id)
+                    if chunk:
+                        evidence_data.append({
+                            "Chunk ID": chunk_id,
+                            "Transcript": chunk.get("transcript_id", ""),
+                            "Topics": ", ".join(chunk.get("matching_topics", [])),
+                            "Importance": f"{chunk.get('max_importance_score', 0):.3f}",
+                            "Preview": chunk["text"][:100] + "..." if len(chunk["text"]) > 100 else chunk["text"]
+                        })
+                
+                if evidence_data:
+                    df = pd.DataFrame(evidence_data)
+                    st.dataframe(df, use_container_width=True)
+                else:
+                    st.warning("No evidence chunks found.")

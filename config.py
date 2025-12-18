@@ -40,3 +40,24 @@ FILLER_WORDS = [
 NORMALIZE_WHITESPACE = True
 REMOVE_REPETITIONS = True
 MIN_SENTIMENT_SCORE = 0.1  # Minimum sentiment score for important statements
+
+# Prescriptive Insights configuration
+PROCESSED_TRANSCRIPTS_DIR = PROJECT_DIR / "processed_transcripts"
+INSIGHTS_CHUNK_DIR = PROJECT_DIR / "insights_chunks"
+INSIGHTS_CHUNK_MAX_CHARS = 1000  # Maximum characters per chunk
+INSIGHTS_CHUNK_WINDOW_SIZE = 4  # Number of statements per chunk
+INSIGHTS_CHUNK_OVERLAP = 1  # Overlap between chunks
+INSIGHTS_CACHE_SIZE = 100  # Maximum number of cached queries
+
+# Ollama LLM configuration
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:latest")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))  # seconds
+OLLAMA_MAX_RETRIES = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+
+# Prescriptive Insights persona configuration
+INSIGHTS_DEFAULT_PERSONA = "Act as a board-certified metabolic health physician, balancing scientific precision with compassionate coaching. Maintain patient empathy while citing transcript chunk IDs to justify each recommendation."
+
+# Create directories if they don't exist
+for dir_path in [INSIGHTS_CHUNK_DIR]:
+    dir_path.mkdir(exist_ok=True)
