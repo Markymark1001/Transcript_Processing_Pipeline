@@ -22,7 +22,7 @@ Before installing this application, ensure you have the following:
 - **pip** (Python package installer)
 - **Git** (for cloning the repository)
 - **Ollama** (required for Prescriptive Insights feature only)
-  - Installation instructions: https://ollama.ai/download
+  - Installation instructions: <https://ollama.ai/download>
   - After installation, run `ollama serve` to start the service
 - **Sufficient disk space** for storing transcripts and processed data
 - **Stable internet connection** for YouTube API access
@@ -539,16 +539,21 @@ When reporting bugs, please include:
 ## FAQ
 
 ### Q: Can I use this without Ollama?
+
 A: Yes, all features except Prescriptive Insights (Tab 4) work without Ollama.
 
 ### Q: How do I increase the download speed?
+
 A: You can adjust the delay settings in the batch download script, but be careful not to set them too low as YouTube may rate-limit your requests.
 
 ### Q: Can I process videos in languages other than English?
+
 A: Currently, the NLP processing is optimized for English transcripts. Support for other languages is planned for future releases.
 
 ### Q: How much storage space do I need?
+
 A: This depends on the number of videos you process. As a rough estimate:
+
 - 1 hour of transcript text: ~50KB
 - Processed transcript with embeddings: ~500KB
 - Plan for at least 1GB for processing 1000+ videos
