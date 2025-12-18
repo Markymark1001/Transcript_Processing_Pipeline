@@ -155,3 +155,15 @@ Thumbs.db
 *.tmp
 *.temp
 drboz_results_intermediate.jsonl
+
+# Generated data
+# Directories containing pipeline outputs
+subtitles/
+processed_transcripts/
+insights_chunks/
+output/
+data/
+
+# Generated manifest and data files
+master_chunks.parquet
+insights_manifest.json
